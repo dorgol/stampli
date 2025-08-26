@@ -1,151 +1,149 @@
 #!/usr/bin/env python3
-"""
-retrieval.py
-Query Chroma with a question embedding + metadata filters and return standardized snippets.
-
-- Works with enriched metadata:
-  * cluster_* (e.g., cluster_mbk / cluster_micro / cluster_kmeans / cluster_hdbscan)
-  * *_label (e.g., cluster_mbk_label ...)
-  * sentiment (optional)
-  * keywords_str (optional)
-"""
-
+# src/retrieval.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+
 import os
+from typing import Any, Dict, Iterable, List, Optional
+
 import chromadb
-from openai import OpenAI
 
-# ---------- Embedding ----------
-def embed_query_openai(text: str, model: str = "text-embedding-3-small") -> List[float]:
+# -------------------- Embedding --------------------
+
+def embed_query_openai(text: str,
+                       model: str = os.getenv("OPENAI_MODEL_EMB", "text-embedding-3-small")) -> List[float]:
+    """
+    Get an embedding vector for the query text using OpenAI embeddings.
+    """
+    try:
+        from openai import OpenAI  # lazy import
+    except Exception as e:
+        raise RuntimeError("OpenAI SDK not installed. Try: pip install openai") from e
+
     if not os.getenv("OPENAI_API_KEY"):
-        raise EnvironmentError("OPENAI_API_KEY not set.")
+        raise EnvironmentError("OPENAI_API_KEY environment variable is not set.")
+
     client = OpenAI()
-    resp = client.embeddings.create(model=model, input=[text])
-    return resp.data[0].embedding
+    resp = client.embeddings.create(model=model, input=text)
+    vec = resp.data[0].embedding
+    # Chroma expects a list[float]
+    return [float(x) for x in vec]
 
-# ---------- Helpers for flexible filters over dynamic columns ----------
-_CLUSTER_ID_KEYS = ["cluster_mbk", "cluster_micro", "cluster_kmeans", "cluster_hdbscan"]
-_CLUSTER_LABEL_KEYS = [f"{k}_label" for k in _CLUSTER_ID_KEYS]
 
-def _one_or_in(field: str, vals):
-    if not vals: return None
-    vals = [v for v in vals if v is not None]
-    if not vals: return None
-    if len(vals) == 1: return {field: vals[0]}
-    return {field: {"$in": vals}}
+# -------------------- Where filter --------------------
 
-def _or_contains(fields: List[str], needle: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not needle:
+def _eq_or_in(field: str, values: Optional[List[Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Turn a list/None into a Chroma equality filter. (Single -> $eq, Multi -> $in)
+    """
+    if not values:
         return None
-    return {"$or": [{f: {"$contains": needle}} for f in fields]}
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return None
+    return {field: {"$in": vals}} if len(vals) > 1 else {field: {"$eq": vals[0]}}
 
-def _or_equals(fields, value):
-    if value is None: return None
-    fields = [f for f in fields if f]
-    if not fields: return None
-    if len(fields) == 1: return {fields[0]: value}
-    return {"$or": [{f: value} for f in fields]}
+def build_where(branch: Optional[List[str]] = None,
+                country: Optional[List[str]] = None,
+                month: Optional[List[int]] = None,
+                season: Optional[List[str]] = None,
+                year: Optional[List[int]] = None,
+                rating_gte: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """
+    Build a Chroma 'where' filter dict using equality / $in and numeric threshold on Rating.
+    Only includes fields that are provided.
+    """
+    clauses: List[Dict[str, Any]] = []
 
-def _compact_and(clauses):
-    clauses = [c for c in clauses if c]
-    if not clauses: return None
-    if len(clauses) == 1: return clauses[0]
-    return {"$and": clauses}
+    for part in (
+        _eq_or_in("Branch", branch),
+        _eq_or_in("Reviewer_Location", country),
+        _eq_or_in("Month", month),
+        _eq_or_in("Season", season),
+        _eq_or_in("Year", year),
+    ):
+        if part:
+            clauses.append(part)
 
-def build_where(
-    branch=None, countries=None, months=None, seasons=None, years=None, rating_gte=None,
-    cluster_label_in=None,   # NEW: list of exact labels (not "contains")
-    cluster_id=None,
-    sentiment_in=None,
-    keywords_in=None         # if you keep tokens/keywords_str exact matches
-):
-    clauses = []
-    v = _one_or_in("Branch", branch);                v and clauses.append(v)
-    v = _one_or_in("Reviewer_Location", countries);  v and clauses.append(v)
-    v = _one_or_in("Month", months);                 v and clauses.append(v)
-    v = _one_or_in("Season", seasons);               v and clauses.append(v)
-    v = _one_or_in("Year", years);                   v and clauses.append(v)
     if rating_gte is not None:
         clauses.append({"Rating": {"$gte": float(rating_gte)}})
 
-    # cluster id across any known id columns
-    v = _or_equals(_CLUSTER_ID_KEYS, int(cluster_id)) if cluster_id is not None else None
-    v and clauses.append(v)
-
-    # cluster label exact match across any known label columns
-    if cluster_label_in:
-        ors = [{lbl_col: {"$in": cluster_label_in}} for lbl_col in _CLUSTER_LABEL_KEYS]
-        clauses.append({"$or": ors} if len(ors) > 1 else ors[0])
-
-    # sentiment exact match
-    v = _one_or_in("sentiment", sentiment_in); v and clauses.append(v)
-
-    # keywords exact match (only if you indexed tokens/keywords_str as exact strings)
-    if keywords_in:
-        clauses.append({"keywords_str": {"$in": keywords_in}})
-
-    return _compact_and(clauses)
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
-# ---------- Retrieval ----------
-def retrieve_snippets(
-    chroma_path: str,
-    collection: str,
-    query_embedding: List[float],
-    where: Optional[Dict[str, Any]],
-    top_k: int = 12,
-    snippet_chars: int = 420,
-) -> List[Dict[str, Any]]:
+# -------------------- Retrieval --------------------
+
+def _pick_cluster_label(meta: Dict[str, Any]) -> Optional[str]:
     """
-    Execute the query against Chroma and return normalized snippets including enriched metadata.
+    Inspect a metadata dict and return the first non-empty *_label value if present.
+    Prefer the most 'active' convention: cluster_*_label keys.
+    """
+    label_keys = [k for k in meta.keys() if k.endswith("_label")]
+    for k in sorted(label_keys):  # deterministic order
+        v = meta.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+def _to_float_or_none(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def _truncate(txt: str, max_chars: int = 600) -> str:
+    t = (txt or "").strip()
+    return t if len(t) <= max_chars else (t[:max_chars] + "…")
+
+def retrieve_snippets(chroma_path: str,
+                      collection: str,
+                      query_embedding: Iterable[float],
+                      where: Optional[Dict[str, Any]] = None,
+                      top_k: int = 8) -> List[Dict[str, Any]]:
+    """
+    Query a persistent Chroma collection and return a normalized list of snippets with metadata:
+      - Review_ID, Branch, Reviewer_Location, Rating
+      - cluster_label (if available), sentiment (if available)
+      - snippet (text), distance (float)
     """
     client = chromadb.PersistentClient(path=chroma_path)
-    col = client.get_or_create_collection(collection)
+    col = client.get_or_create_collection(name=collection, metadata={"hnsw:space": "cosine"})
 
     res = col.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
+        query_embeddings=[list(query_embedding)],
+        n_results=int(top_k),
         where=where,
-        include=["documents", "metadatas", "distances"],
+        include=["metadatas", "documents", "distances"],
     )
 
-    ids   = res.get("ids", [[]])[0]
-    docs  = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    dists = res.get("distances", [[]])[0]
-
+    # Normalize Chroma response into a list of dicts
     out: List[Dict[str, Any]] = []
-    for rid, doc, meta, dist in zip(ids, docs, metas, dists):
-        text = doc or ""
-        snip = text[:snippet_chars] + ("…" if len(text) > snippet_chars else "")
+    docs = res.get("documents", [[]])[0]
+    mets = res.get("metadatas", [[]])[0]
+    dists = res.get("distances", [[]])[0] or []
 
-        # pick whichever cluster id/label exists in this record
-        cluster_id = None
-        cluster_label = None
-        for k in _CLUSTER_ID_KEYS:
-            if k in meta:
-                cluster_id = meta.get(k)
-                break
-        for k in _CLUSTER_LABEL_KEYS:
-            if k in meta:
-                cluster_label = meta.get(k)
-                break
+    for i in range(min(len(docs), len(mets))):
+        meta = mets[i] or {}
+        doc = docs[i] or ""
+        dist = dists[i] if i < len(dists) else None
+
+        # Pick cluster label if available
+        clabel = _pick_cluster_label(meta)
 
         out.append({
-            "id": str(rid),
-            "Review_ID": meta.get("Review_ID", rid),
+            "Review_ID": meta.get("Review_ID"),
             "Branch": meta.get("Branch"),
             "Reviewer_Location": meta.get("Reviewer_Location"),
-            "Year": meta.get("Year"),
-            "Month": meta.get("Month"),
-            "Season": meta.get("Season"),
             "Rating": meta.get("Rating"),
-            "cluster_id": cluster_id,
-            "cluster_label": cluster_label,
+            "cluster_label": clabel,
             "sentiment": meta.get("sentiment"),
-            "keywords_str": meta.get("keywords_str"),
-            "distance": float(dist),
-            "snippet": snip,
+            "snippet": _truncate(str(doc)),
+            "distance": _to_float_or_none(dist),
         })
+
     return out

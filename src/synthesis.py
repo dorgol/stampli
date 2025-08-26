@@ -1,76 +1,72 @@
-#!/usr/bin/env python3
-"""
-synthesis.py
-Given a question, precomputed stats, and retrieved snippets,
-ask GPT-4o-mini to synthesize a grounded answer.
+# synthesis.py
 
-This module is library-only (no CLI).
-"""
-
-import json
-from typing import Any, Dict, List
-
+from typing import List, Dict, Any, Optional
+import os
 from openai import OpenAI
 
+OPENAI_MODEL_SYNTH = os.getenv("OPENAI_MODEL_SYNTH", "gpt-4o-mini")
+
+def _summarize_stats(stats: Dict[str, Any]) -> str:
+    """Compact 2–4 lines for the prompt from dataset-level stats."""
+    if not stats:
+        return "No aggregate stats available."
+    n = stats.get("n") or stats.get("n_matching_reviews")
+    avg = stats.get("avg_rating")
+    top_clusters = []
+    for row in (stats.get("by_cluster_label") or [])[:3]:
+        lbl, cnt = row.get("cluster_label"), row.get("count")
+        if lbl and cnt:
+            top_clusters.append(f"{lbl} ({cnt})")
+    parts = []
+    if n is not None: parts.append(f"Total matching reviews: {n}.")
+    if avg is not None: parts.append(f"Average rating: {avg:.2f}.")
+    if top_clusters: parts.append("Top clusters: " + ", ".join(top_clusters) + ".")
+    return " ".join(parts) if parts else "No aggregate stats available."
 
 def synthesize_answer(
     question: str,
-    stats: Dict[str, Any],
     snippets: List[Dict[str, Any]],
-    model: str = "gpt-4o-mini"
+    *,
+    stats: Optional[Dict[str, Any]] = None,
+    model: str = OPENAI_MODEL_SYNTH,
 ) -> str:
     """
-    Ask the LLM to write a concise, grounded answer using provided stats + snippets.
+    Produce the final answer using dataset-level stats for trends + snippets for evidence.
     """
-    client = OpenAI()
+    # Build compact evidence block
+    lines = []
+    for i, s in enumerate(snippets[:10], 1):
+        meta = []
+        if s.get("Branch"):         meta.append(str(s["Branch"]))
+        if s.get("cluster_label"):  meta.append(str(s["cluster_label"]))
+        if s.get("sentiment"):      meta.append(f"sentiment={s['sentiment']}")
+        if s.get("Rating") is not None: meta.append(f"⭐{s['Rating']}")
+        header = f"[{i}] " + " | ".join(meta)
+        lines.append(header + "\n" + s.get("snippet",""))
+    evidence = "\n\n".join(lines) if lines else "No snippets."
 
-    # Keep only compact preview snippets to avoid blowing up the context
-    preview = []
-    for s in snippets[:8]:
-        preview.append({
-            "id": s.get("Review_ID") or s.get("id"),
-            "branch": s.get("Branch"),
-            "country": s.get("Reviewer_Location"),
-            "year": s.get("Year"), "month": s.get("Month"),
-            "rating": s.get("Rating"),
-            "quote": (s.get("snippet") or "")[:300]
-        })
+    stats_txt = _summarize_stats(stats) if stats else "No aggregate stats available."
 
-    system_msg = (
-        "You are a precise analyst. Answer ONLY using the provided statistics and review snippets. "
-        "Start with a clear 1–2 sentence verdict. Then add 2–4 bullet points with key numbers "
-        "(round percentages; show n where helpful). Cite 2–3 review IDs inline like [ID: 670772142]. "
-        "If evidence is weak (n<20), state uncertainty."
+    sys = (
+        "You are a careful analyst. Use dataset-wide stats for overall trends and the snippets as grounded evidence. "
+        "Be concise and actionable. If evidence conflicts, note the nuance. Do not invent facts."
+    )
+    usr = (
+        f"Question: {question}\n\n"
+        f"Dataset stats:\n{stats_txt}\n\n"
+        f"Snippets:\n{evidence}\n\n"
+        "Write a short answer (4–7 sentences), then 2–3 concrete action items."
     )
 
-    payload = {"question": question, "stats": stats, "snippets": preview}
+    if not os.getenv("OPENAI_API_KEY"):
+        # Fallback if no key — basic concatenation so the app still renders something.
+        return f"{stats_txt}\n\nExamples:\n" + "\n\n".join(lines[:3])
 
+    client = OpenAI()
     resp = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": json.dumps(payload)},
-        ],
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": usr}],
         temperature=0.2,
         max_tokens=450,
     )
-
     return resp.choices[0].message.content.strip()
-
-
-def run(
-    question: str,
-    stats: Dict[str, Any],
-    snippets: List[Dict[str, Any]],
-    model: str = "gpt-4o-mini"
-) -> Dict[str, Any]:
-    """
-    Public entry: return dict with answer + citations.
-    """
-    answer_text = synthesize_answer(question, stats, snippets, model=model)
-    citations = [s.get("Review_ID") for s in snippets[:3] if s.get("Review_ID") is not None]
-
-    return {
-        "answer": answer_text,
-        "citations": citations,
-    }
