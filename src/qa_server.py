@@ -1,105 +1,80 @@
 #!/usr/bin/env python3
-"""
-qa_server.py
-FastAPI server exposing a Q&A endpoint over Disney reviews.
-
-Run:
-    uvicorn src.qa_server:app --reload --port 8000
-"""
-
+# src/qa_server.py
 from __future__ import annotations
-
-import os
-from typing import Dict, Any
-
-import pandas as pd
+from typing import List, Dict, Any, Optional
+import os, json
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from openai import OpenAI
 
-from src.analysis_tool import add_derived_cols, apply_filters, compute_metrics
-from src.query_parser import parse_question
-from src.retrieval import embed_query_openai, build_where, retrieve_snippets
-from src.synthesis import run as synthesize
+from src.query_parser import parse_question, build_where_from_filters, DEFAULT_PARQUET
+from src.retrieval import embed_query_openai, retrieve_snippets
 
-# ---------- Config ----------
-META_PATH = os.getenv("META_PATH", "data/embeddings_out/reviews_with_embeddings.parquet")
-CHROMA_PATH = os.getenv("CHROMA_PATH", "data/index/chroma_db")
-COLLECTION = os.getenv("COLLECTION", "reviews")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "index/chroma_db")
+COLLECTION  = os.getenv("CHROMA_COLLECTION", "reviews")
+LABELED_PARQUET = os.getenv("LABELED_PARQUET", DEFAULT_PARQUET)
+OPENAI_MODEL_SYNTH = os.getenv("OPENAI_MODEL_SYNTH", "gpt-4o-mini")
 
-# Load metadata once
-_df_meta: pd.DataFrame | None = None
+app = FastAPI(title="Disney Reviews QA")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+)
 
-
-def get_meta_df() -> pd.DataFrame:
-    global _df_meta
-    if _df_meta is None:
-        df = pd.read_parquet(META_PATH)
-        df = add_derived_cols(df)
-        _df_meta = df
-    return _df_meta
-
-
-# ---------- API ----------
-app = FastAPI(title="Disney Reviews QA", version="0.1.0")
-
-
-class QARequest(BaseModel):
+class AskReq(BaseModel):
     question: str
-    top_k: int = 12
+    top_k: int = 8
 
-
-class QAResponse(BaseModel):
+class AskResp(BaseModel):
     answer: str
     filters: Dict[str, Any]
-    stats: Dict[str, Any]
-    citations: list[int]
-    snippets_used: list[Dict[str, Any]]
+    where: Optional[Dict[str, Any]]
+    snippets: List[Dict[str, Any]]
 
+def synthesize_answer(question: str, snippets: List[Dict[str, Any]], model: str = OPENAI_MODEL_SYNTH) -> str:
+    """LLM summary grounded in retrieved snippets (shows cluster labels when present)."""
+    if not os.getenv("OPENAI_API_KEY"):
+        # Fallback: simple extractive answer
+        bullets = []
+        for s in snippets[:5]:
+            tag = s.get("cluster_label") or s.get("sentiment") or ""
+            bullets.append(f"- ({tag}) {s['snippet']}")
+        return "Here’s what I found:\n" + "\n".join(bullets)
 
-@app.post("/qa", response_model=QAResponse)
-def answer_question(req: QARequest):
-    """
-    Main endpoint: ask a natural language question and get a grounded answer.
-    """
-    # 1. Parse NL question into structured filters
-    parsed = parse_question(req.question)
+    # Build compact evidence block
+    lines = []
+    for i, s in enumerate(snippets[:10], 1):
+        meta = []
+        if s.get("Branch"):         meta.append(str(s["Branch"]))
+        if s.get("cluster_label"):  meta.append(str(s["cluster_label"]))
+        if s.get("sentiment"):      meta.append(f"sentiment={s['sentiment']}")
+        if s.get("Rating") is not None: meta.append(f"⭐{s['Rating']}")
+        header = f"[{i}] " + " | ".join(meta)
+        lines.append(header + "\n" + s["snippet"])
+    evidence = "\n\n".join(lines)
 
-    branch   = parsed.get("branch")
-    country  = parsed.get("country")
-    month    = parsed.get("month")
-    season   = parsed.get("season")
-    year     = parsed.get("year")
-    rating_gte = parsed.get("rating_gte")
-
-    # 2. Analysis: compute stats over filtered reviews
-    df = get_meta_df()
-    filtered = apply_filters(df, branch, country, month, season, year, rating_gte)
-    stats = compute_metrics(filtered)
-
-    # 3. Retrieval: get evidence snippets from Chroma
-    q_emb = embed_query_openai(req.question)
-    where = build_where(branch, country, month, season, year, rating_gte)
-    snippets = retrieve_snippets(
-        chroma_path=CHROMA_PATH,
-        collection=COLLECTION,
-        query_embedding=q_emb,
-        where=where,
-        top_k=req.top_k,
+    sys = (
+        "Answer the user's question using ONLY the provided snippets. "
+        "Be concise and actionable. If evidence conflicts, note the nuance. "
+        "If asked about seasons/months/branches, be explicit. "
+        "Do not hallucinate facts not present in the snippets."
     )
+    usr = f"Question: {question}\n\nSnippets:\n{evidence}\n\nWrite a short answer (4–7 sentences), then 2–3 action items."
 
-    # 4. Synthesis: generate grounded answer
-    synth = synthesize(req.question, stats, snippets)
+    client = OpenAI()
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role":"system","content":sys},{"role":"user","content":usr}],
+        temperature=0.2, max_tokens=400
+    )
+    return resp.choices[0].message.content.strip()
 
-    # 5. Build payload
-    return {
-        "answer": synth["answer"],
-        "filters": parsed,
-        "stats": stats,
-        "citations": synth["citations"],
-        "snippets_used": snippets[:8],
-    }
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.post("/ask", response_model=AskResp)
+def ask(req: AskReq):
+    filters, catalog = parse_question(req.question, parquet_path=LABELED_PARQUET)
+    where = build_where_from_filters(filters, catalog)
+    emb = embed_query_openai(req.question)
+    snippets = retrieve_snippets(CHROMA_PATH, COLLECTION, emb, where=where, top_k=req.top_k)
+    answer = synthesize_answer(req.question, snippets)
+    return AskResp(answer=answer, filters=filters, where=where, snippets=snippets)

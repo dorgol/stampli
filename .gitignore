@@ -40,3 +40,5 @@ data/local_*
 data/
 project_export.bat
 project_export.txt
+index
+clustering_out
