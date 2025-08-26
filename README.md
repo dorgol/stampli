@@ -37,7 +37,6 @@ PowerShell -ExecutionPolicy Bypass -File .\scripts\fetch_artifacts.ps1
 This will create:
 
 ```
-clustering_out/reviews_with_clusters_labeled.parquet
 index/chroma_db/
 ```
 
