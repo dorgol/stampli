@@ -11,7 +11,7 @@ Usage:
 import argparse
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from openai import OpenAI
 
@@ -70,7 +70,7 @@ def parse_question(question: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
             "type": "json_schema",
             "json_schema": {
                 "name": "DisneyReviewQuery",
-                "strict": True,             # disallow undeclared fields/types
+                "strict": True,
                 "schema": QUERY_SCHEMA
             }
         }
@@ -80,7 +80,7 @@ def parse_question(question: str, model: str = "gpt-4o-mini") -> Dict[str, Any]:
     # Safety normalization (should already be correct due to schema)
     for k in ("branch","country"):
         v = data.get(k)
-        if isinstance(v, str):         # just-in-case guard
+        if isinstance(v, str):
             data[k] = [v]
     return data
 

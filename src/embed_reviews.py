@@ -94,8 +94,7 @@ def embed_st(texts: List[str], model_name: str = "all-MiniLM-L6-v2",
 def save_outputs(df: pd.DataFrame,
                  embeddings: np.ndarray,
                  out_dir: str,
-                 id_col: str = "Review_ID",
-                 text_col: str = "Review_Text") -> Tuple[Path, Path, Path]:
+                 id_col: str = "Review_ID") -> Tuple[Path, Path, Path]:
     outp = Path(out_dir)
     outp.mkdir(parents=True, exist_ok=True)
     npy_path = outp / "embeddings.npy"
@@ -134,7 +133,7 @@ def main():
         embs = embed_st(texts, model_name=args.st_model, batch_size=args.batch_size)
 
     parquet_path, npy_path, npz_path = save_outputs(df, embs, args.out_dir,
-                                                    id_col=args.id_col, text_col=args.text_col)
+                                                    id_col=args.id_col)
     print(f"Saved: {parquet_path}")
     print(f"Saved: {npy_path}")
     print(f"Saved: {npz_path}")

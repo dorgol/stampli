@@ -105,8 +105,8 @@ def run_microcluster_hdbscan(
         core_dist_n_jobs=-1,
         prediction_data=True,
     ).fit(centroids)
-    centroid_labels = cl.labels_                 # labels for each centroid
-    point_labels = centroid_labels[mbk.labels_]  # map each point via its assigned centroid
+    centroid_labels = cl.labels_
+    point_labels = centroid_labels[mbk.labels_]
     dur = time.time() - t0
     return point_labels, dur, centroid_labels
 
@@ -134,6 +134,10 @@ def main():
     ap.add_argument("--min_samples", type=int, default=20, help="for HDBSCAN")
     ap.add_argument("--micro_clusters", type=int, default=400, help="for micro_hdbscan")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--merge_labels", action="store_true",
+                    help="If set, merge LLM labels from --labels_csv onto the clustered reviews")
+    ap.add_argument("--labels_csv", type=str, default="labeling_out/cluster_labels.csv",
+                    help="CSV produced by label_clusters_llm.py (columns: cluster,label,...)")
     args = ap.parse_args()
 
     outp = Path(args.out_dir)
@@ -166,6 +170,7 @@ def main():
         df["cluster_hdbscan"] = labels
 
     else:  # micro_hdbscan
+        import pandas as pd
         labels, dur, centroid_labels = run_microcluster_hdbscan(
             Xp, m=args.micro_clusters,
             min_cluster_size=args.min_cluster_size, min_samples=args.min_samples,
@@ -191,8 +196,19 @@ def main():
     summary, csv_path = summarize(df[lab_col].values, method_name, outp)
     print("Top clusters:\n", summary.head(15))
 
-    # Save clustered reviews
-    out_parquet = outp / "reviews_with_clusters.parquet"
+    if args.merge_labels:
+        import pandas as pd
+        print(f"Merging labels from {args.labels_csv} onto {lab_col} ...")
+        labels = pd.read_csv(args.labels_csv)  # from label_clusters_llm.py
+        # labels has column "cluster"; align to current lab_col
+        labels = labels.rename(columns={"cluster": lab_col, "label": f"{lab_col}_label"})
+        keep_cols = [lab_col, f"{lab_col}_label", "keywords", "sentiment", "summary", "actions", "confidence"]
+        keep_cols = [c for c in keep_cols if c in labels.columns]
+        df = df.merge(labels[keep_cols], on=lab_col, how="left")
+
+    # Save clustered
+    base_name = "reviews_with_clusters_labeled.parquet" if args.merge_labels else "reviews_with_clusters.parquet"
+    out_parquet = outp / base_name
     df.to_parquet(out_parquet, index=False)
     print(f"Saved: {out_parquet}")
     print(f"Saved: {csv_path}")

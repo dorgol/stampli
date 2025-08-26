@@ -57,7 +57,7 @@ def main():
     args = ap.parse_args()
 
     # Load
-    X = np.load(args.embeddings)  # shape [n, d], dtype float32
+    X = np.load(args.embeddings)
     df = pd.read_parquet(args.meta)
     if len(df) != X.shape[0]:
         raise ValueError(f"Row mismatch: meta={len(df)} vs embeddings={X.shape[0]}")
@@ -68,10 +68,8 @@ def main():
                          f"Re-run your embedding script so it preserves metadata.")
 
     df = add_derived_cols(df)
-    # Ensure unique IDs as strings for Chroma
     df["doc_id"] = df["Review_ID"].astype(str)
 
-    # Start Chroma (persistent)
     Path(args.chroma_path).mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=args.chroma_path)
 
@@ -81,7 +79,6 @@ def main():
         except Exception:
             pass
 
-    # Cosine space is default; we pass embeddings directly
     col = client.get_or_create_collection(name=args.collection, metadata={"hnsw:space": "cosine"})
 
     n = len(df)
