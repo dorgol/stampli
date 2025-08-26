@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
 """
 Streamlit UI for Disney Reviews QA
 Run:
     streamlit run app.py
 """
-
 import requests
 import streamlit as st
 
