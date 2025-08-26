@@ -1,0 +1,5 @@
+-r requirements.txt
+scikit-learn>=1.4
+hdbscan>=0.8
+pynndescent>=0.5
+sentence-transformers>=3.0
