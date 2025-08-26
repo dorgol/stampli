@@ -8,9 +8,12 @@ dependencies = [
     "fastapi>=0.116.1",
     "fastparquet>=2024.11.0",
     "hdbscan>=0.8.40",
+    "matplotlib>=3.10.5",
+    "notebook>=7.4.5",
     "openai>=1.101.0",
     "pyarrow>=21.0.0",
     "pynndescent>=0.5.13",
+    "seaborn>=0.13.2",
     "sentence-transformers>=5.1.0",
     "streamlit>=1.48.1",
 ]
